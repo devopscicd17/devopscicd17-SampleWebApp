@@ -1,0 +1,84 @@
+name: Build & Deploy Docker to EC2 via ECR
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    # -----------------------------
+    # Checkout Code
+    # -----------------------------
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    # -----------------------------
+    # Configure AWS Credentials
+    # -----------------------------
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    # -----------------------------
+    # Login to Amazon ECR
+    # -----------------------------
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v1
+
+    # -----------------------------
+    # Build, Tag & Push Docker Image
+    # -----------------------------
+    - name: Build, Tag, and Push to ECR
+      run: |
+        ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+        IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
+        TAG="latest"
+
+        docker build -t $IMAGE_NAME:$TAG .
+        docker tag $IMAGE_NAME:$TAG $ECR_URL/$IMAGE_NAME:$TAG
+        docker push $ECR_URL/$IMAGE_NAME:$TAG
+
+    # -----------------------------
+    # Deploy to EC2 (Docker Pull & Restart)
+    # -----------------------------
+    - name: Deploy on EC2
+      uses: appleboy/ssh-action@v0.1.7
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: |
+          ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+          IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
+          TAG="latest"
+
+          # Install docker if missing
+          if ! command -v docker &> /dev/null
+          then
+              echo "Docker not found. Installing..."
+              sudo yum install docker -y || sudo apt install docker.io -y
+              sudo service docker start
+              sudo usermod -aG docker $USER
+          fi
+
+          # Login to ECR on EC2 host
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+          | sudo docker login --username AWS --password-stdin $ECR_URL
+
+          # Pull new image
+          sudo docker pull $ECR_URL/$IMAGE_NAME:$TAG
+
+          # Stop old container if running
+          sudo docker stop app || true
+          sudo docker rm app || true
+
+          # Run container
+          sudo docker run -d --name app -p 80:8080 $ECR_URL/$IMAGE_NAME:$TAG
+
+          echo "Deployment completed successfully!"
