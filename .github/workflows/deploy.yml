@@ -16,6 +16,21 @@ jobs:
       uses: actions/checkout@v3
 
     # -----------------------------
+    # Set Up Java for Maven Build
+    # -----------------------------
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        java-version: "17"
+        distribution: "temurin"
+
+    # -----------------------------
+    # Build WAR File
+    # -----------------------------
+    - name: Build WAR using Maven
+      run: mvn -B clean package --file pom.xml
+
+    # -----------------------------
     # Configure AWS Credentials
     # -----------------------------
     - name: Configure AWS credentials
@@ -40,8 +55,13 @@ jobs:
         IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
         TAG="latest"
 
+        echo "Building Docker image..."
         docker build -t $IMAGE_NAME:$TAG .
+
+        echo "Tagging Docker image..."
         docker tag $IMAGE_NAME:$TAG $ECR_URL/$IMAGE_NAME:$TAG
+
+        echo "Pushing Docker image to ECR..."
         docker push $ECR_URL/$IMAGE_NAME:$TAG
 
     # -----------------------------
@@ -67,6 +87,13 @@ jobs:
               sudo usermod -aG docker $USER
           fi
 
+          # Install AWS CLI if missing
+          if ! command -v aws &> /dev/null
+          then
+              echo "Installing AWS CLI..."
+              sudo yum install awscli -y || sudo apt install awscli -y
+          fi
+
           # Login to ECR on EC2 host
           aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
           | sudo docker login --username AWS --password-stdin $ECR_URL
@@ -78,7 +105,7 @@ jobs:
           sudo docker stop app || true
           sudo docker rm app || true
 
-          # Run container
+          # Run app container
           sudo docker run -d --name app -p 80:8080 $ECR_URL/$IMAGE_NAME:$TAG
 
           echo "Deployment completed successfully!"
