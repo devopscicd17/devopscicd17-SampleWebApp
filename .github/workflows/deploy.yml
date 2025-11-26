@@ -9,23 +9,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-    # Checkout Code
+    # ---------------------------------------------------------
+    # CHECKOUT CODE (Full history required for TruffleHog)
+    # ---------------------------------------------------------
     - name: Checkout repository
       uses: actions/checkout@v3
-
-    # -----------------------------
-    # TRUFFLEHOG – Secret Scanning
-    # -----------------------------
-    - name: TruffleHog Secrets Scan
-      uses: trufflesecurity/trufflehog@main
       with:
-        path: .
-        base: "HEAD~1"
-        head: "HEAD"
-      continue-on-error: false
+        fetch-depth: 0   # MUST for TruffleHog Git history scan
 
-    # Build WAR File using Maven
+    # ---------------------------------------------------------
+    # BUILD WAR USING MAVEN
+    # ---------------------------------------------------------
     - name: Set up Java
       uses: actions/setup-java@v3
       with:
@@ -35,10 +29,19 @@ jobs:
     - name: Build WAR using Maven
       run: mvn -B clean package --file pom.xml
 
-    # -----------------------------
+    # ---------------------------------------------------------
+    # TRUFFLEHOG – SECRETS SCANNING
+    # ---------------------------------------------------------
+    - name: TruffleHog Secrets Scan
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: .
+      continue-on-error: false
+
+    # ---------------------------------------------------------
     # SONARQUBE / SONARCLOUD (SAST)
-    # -----------------------------
-    - name: SonarQube Scan
+    # ---------------------------------------------------------
+    - name: SonarCloud Scan
       uses: SonarSource/sonarcloud-github-action@v2
       env:
         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -46,9 +49,9 @@ jobs:
       with:
         projectBaseDir: .
 
-    # -----------------------------
-    # SNYK SECURITY SCANS
-    # -----------------------------
+    # ---------------------------------------------------------
+    # SNYK SECURITY SCANS – SCA, SAST, CONTAINER SCAN
+    # ---------------------------------------------------------
     - name: Install Snyk CLI
       uses: snyk/actions/setup@v1
       env:
@@ -66,7 +69,7 @@ jobs:
       env:
         SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-    # Build Docker Image for Snyk Container Scan
+    # Build Docker Image for Container Scan
     - name: Build Docker Image
       run: docker build -t app:latest .
 
@@ -76,9 +79,9 @@ jobs:
       env:
         SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-    # -----------------------------
-    # Configure AWS Credentials
-    # -----------------------------
+    # ---------------------------------------------------------
+    # AWS CONFIGURATION
+    # ---------------------------------------------------------
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -86,11 +89,12 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
-    # Login to Amazon ECR
     - name: Login to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v1
 
-    # Build, Tag & Push Docker Image
+    # ---------------------------------------------------------
+    # DOCKER BUILD & PUSH TO ECR
+    # ---------------------------------------------------------
     - name: Build, Tag, and Push to ECR
       run: |
         ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
@@ -101,7 +105,9 @@ jobs:
         docker tag $IMAGE_NAME:$TAG $ECR_URL/$IMAGE_NAME:$TAG
         docker push $ECR_URL/$IMAGE_NAME:$TAG
 
-    # Deploy to EC2
+    # ---------------------------------------------------------
+    # DEPLOY TO EC2 VIA SSH
+    # ---------------------------------------------------------
     - name: Deploy on EC2
       uses: appleboy/ssh-action@v0.1.7
       with:
