@@ -9,16 +9,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
     # ---------------------------------------------------------
-    # CHECKOUT CODE (Full history required for TruffleHog)
+    # CHECKOUT (Full history for TruffleHog)
     # ---------------------------------------------------------
     - name: Checkout repository
       uses: actions/checkout@v3
       with:
-        fetch-depth: 0   # MUST for TruffleHog Git history scan
+        fetch-depth: 0   # required for TruffleHog
 
     # ---------------------------------------------------------
-    # BUILD WAR USING MAVEN
+    # BUILD (Maven)
     # ---------------------------------------------------------
     - name: Set up Java
       uses: actions/setup-java@v3
@@ -30,18 +31,18 @@ jobs:
       run: mvn -B clean package --file pom.xml
 
     # ---------------------------------------------------------
-    # TRUFFLEHOG – SECRETS SCANNING
+    # SECRETS SCAN (TruffleHog)
     # ---------------------------------------------------------
     - name: TruffleHog Secrets Scan
       uses: trufflesecurity/trufflehog@main
       with:
         path: .
-      continue-on-error: false
+      continue-on-error: false   # Fail pipeline on real secrets
 
     # ---------------------------------------------------------
-    # SONARQUBE / SONARCLOUD (SAST)
+    # SAST (SonarCloud)
     # ---------------------------------------------------------
-    - name: SonarCloud Scan
+    - name: SonarQube Scan
       uses: SonarSource/sonarcloud-github-action@v2
       env:
         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -50,37 +51,36 @@ jobs:
         projectBaseDir: .
 
     # ---------------------------------------------------------
-    # SNYK SECURITY SCANS – SCA, SAST, CONTAINER SCAN
+    # SNYK (SCA + SAST + Container Scan)
     # ---------------------------------------------------------
     - name: Install Snyk CLI
       uses: snyk/actions/setup@v1
       env:
         SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-    # Snyk SCA
+    # Snyk SCA Scan
     - name: Snyk Open Source Scan (SCA)
       run: snyk test --severity-threshold=high
       env:
         SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-    # Snyk SAST
+    # Snyk SAST Scan
     - name: Snyk Code Scan (SAST)
       run: snyk code test --severity-threshold=high
       env:
         SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-    # Build Docker Image for Container Scan
-    - name: Build Docker Image
+    # Build Image for Snyk Container Scan
+    - name: Build Docker Image for Snyk Scan
       run: docker build -t app:latest .
 
-    # Snyk Container Scan
     - name: Snyk Container Scan
       run: snyk container test app:latest --severity-threshold=high
       env:
         SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     # ---------------------------------------------------------
-    # AWS CONFIGURATION
+    # AWS CREDENTIALS
     # ---------------------------------------------------------
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
@@ -89,13 +89,14 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
+    # Login to ECR
     - name: Login to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v1
 
     # ---------------------------------------------------------
-    # DOCKER BUILD & PUSH TO ECR
+    # BUILD + PUSH IMAGE
     # ---------------------------------------------------------
-    - name: Build, Tag, and Push to ECR
+    - name: Build, Tag and Push Docker Image to ECR
       run: |
         ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
         IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
@@ -106,7 +107,7 @@ jobs:
         docker push $ECR_URL/$IMAGE_NAME:$TAG
 
     # ---------------------------------------------------------
-    # DEPLOY TO EC2 VIA SSH
+    # DEPLOYMENT ON EC2
     # ---------------------------------------------------------
     - name: Deploy on EC2
       uses: appleboy/ssh-action@v0.1.7
@@ -130,6 +131,7 @@ jobs:
             sudo yum install awscli -y || sudo apt install awscli -y
           fi
 
+          # Login to ECR and pull image
           aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
             | sudo docker login --username AWS --password-stdin $ECR_URL
 
@@ -141,3 +143,19 @@ jobs:
           sudo docker run -d --name app -p 80:8080 $ECR_URL/$IMAGE_NAME:$TAG
 
           echo "Deployment completed successfully!"
+
+    # ---------------------------------------------------------
+    # OWASP ZAP (DAST)
+    # ---------------------------------------------------------
+    - name: OWASP ZAP Baseline Scan (DAST)
+      uses: zaproxy/action-baseline@v0.10.0
+      with:
+        target: "http://${{ secrets.EC2_HOST }}"
+        cmd_options: "-a"
+      continue-on-error: true
+
+    - name: Upload ZAP Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: zap-report
+        path: zap-report.html
