@@ -14,6 +14,17 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v3
 
+    # -----------------------------
+    # TRUFFLEHOG – Secret Scanning
+    # -----------------------------
+    - name: TruffleHog Secrets Scan
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: .
+        base: "HEAD~1"
+        head: "HEAD"
+      continue-on-error: false
+
     # Build WAR File using Maven
     - name: Set up Java
       uses: actions/setup-java@v3
