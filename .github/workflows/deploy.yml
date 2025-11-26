@@ -1,4 +1,4 @@
-name: Build & Deploy Docker to EC2 via ECR
+name: Build, Scan & Deploy Docker to EC2 via ECR
 
 on:
   push:
@@ -27,6 +27,61 @@ jobs:
 
     - name: Build WAR using Maven
       run: mvn -B clean package --file pom.xml
+
+    # ============================================================
+    #                SONARQUBE / SONARCLOUD (SAST)
+    # ============================================================
+    - name: SonarQube Scan (SAST)
+      uses: SonarSource/sonarcloud-github-action@v2
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      with:
+        projectBaseDir: .
+
+    # ============================================================
+    #                SNYK INSTALL
+    # ============================================================
+    - name: Install Snyk CLI
+      uses: snyk/actions/setup@v1
+
+    # ============================================================
+    #                SNYK OPEN SOURCE (SCA)
+    # ============================================================
+    - name: Snyk Open Source Scan (SCA)
+      uses: snyk/actions/scan@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        command: test
+        args: "--severity-threshold=high"
+
+    # ============================================================
+    #                SNYK CODE SCAN (SAST)
+    # ============================================================
+    - name: Snyk Code Scan (SAST)
+      run: snyk code test --severity-threshold=high
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+    # ============================================================
+    #                DOCKER BUILD (For Container Scan)
+    # ============================================================
+    - name: Build Docker Image for Snyk
+      run: |
+        docker build -t app:latest .
+
+    # ============================================================
+    #                SNYK CONTAINER SCAN
+    # ============================================================
+    - name: Snyk Container Scan
+      run: snyk container test app:latest --severity-threshold=high
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+    # -------------------------------------------------------------
+    # After scans succeed → Deploy to AWS
+    # -------------------------------------------------------------
 
     # -----------------------------
     # Configure AWS Credentials
@@ -63,7 +118,7 @@ jobs:
         docker push $ECR_URL/$IMAGE_NAME:$TAG
 
     # -----------------------------
-    # Deploy to EC2 (Pull & Restart Container)
+    # Deploy to EC2
     # -----------------------------
     - name: Deploy on EC2
       uses: appleboy/ssh-action@v0.1.7
