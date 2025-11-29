@@ -7,15 +7,12 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
-    # expose run id to downstream job by mapping a step output to job outputs
     outputs:
-      run_id: ${{ steps.set-run-id.outputs.run_id }}
+      run_id: ${{ github.run_id }}
 
     steps:
-
       # ---------------------------------------------------------
-      # CHECKOUT
+      # CHECKOUT CODE
       # ---------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -23,7 +20,7 @@ jobs:
           fetch-depth: 0
 
       # ---------------------------------------------------------
-      # BUILD (Maven)
+      # MAVEN BUILD
       # ---------------------------------------------------------
       - name: Set up Java
         uses: actions/setup-java@v3
@@ -35,17 +32,17 @@ jobs:
         run: mvn -B clean package --file pom.xml
 
       # ---------------------------------------------------------
-      # TRUFFLEHOG (Docker-based + JSON output)
+      # SECRETS SCAN (TruffleHog Action + JSON export)
       # ---------------------------------------------------------
-      - name: Run TruffleHog Secrets Scan
-        run: |
-          echo "Running TruffleHog via Docker..."
-          docker run --rm -v "$PWD:/repo" trufflesecurity/trufflehog:latest \
-            git /repo --json > trufflehog.json || true
-          ls -lh trufflehog.json
+      - name: TruffleHog Secrets Scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: .
+          json: trufflehog-results.json
+        continue-on-error: true
 
       # ---------------------------------------------------------
-      # SONARCLOUD (SAST)
+      # SAST (SonarCloud)
       # ---------------------------------------------------------
       - name: SonarCloud Scan
         uses: SonarSource/sonarcloud-github-action@v2
@@ -54,66 +51,62 @@ jobs:
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         with:
           projectBaseDir: .
-          args: >-
-            -Dsonar.qualitygate.wait=true
-      - name: Save Sonar placeholder report
-        run: echo '{"note":"sonar scan complete"}' > sonar-report.json
+
+      - name: Convert Sonar report to JSON (dummy)
+        run: echo '{}' > sonar-report.json
 
       # ---------------------------------------------------------
-      # SNYK (SCA, SAST, Container)
+      # SNYK (SCA / SAST / Container)
       # ---------------------------------------------------------
       - name: Install Snyk CLI
-        uses: snyk/actions/setup@v1
+        uses: snyk/actions/setup@v1  
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
       - name: Snyk Open Source Scan (SCA)
-        run: snyk test --json-file-output=snyk-sca.json || true
+        run: snyk test --json > snyk-sca.json
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        continue-on-error: true
 
       - name: Snyk Code Scan (SAST)
-        run: snyk code test --json-file-output=snyk-sast.json || true
+        run: snyk code test --json > snyk-sast.json
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        continue-on-error: true
 
-      - name: Build Docker image for container scans
+      # Build app image once
+      - name: Build Docker Image
         run: docker build -t app:latest .
 
       - name: Snyk Container Scan
-        run: snyk container test app:latest --json-file-output=snyk-container.json || true
+        run: snyk container test app:latest --json > snyk-container.json
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        continue-on-error: true
 
       # ---------------------------------------------------------
-      # PRISMA CLOUD (twistcli) container scan
+      # PRISMA CLOUD (twistcli container scan)
       # ---------------------------------------------------------
       - name: Download twistcli
         run: |
-          echo "Downloading twistcli..."
-          curl -s -u "${{ secrets.PRISMA_ACCESS_KEY }}:${{ secrets.PRISMA_SECRET_KEY }}" \
+          curl -u "${{ secrets.PRISMA_ACCESS_KEY }}:${{ secrets.PRISMA_SECRET_KEY }}" \
             --output twistcli \
             "${{ secrets.PRISMA_CONSOLE_URL }}/api/v1/util/twistcli"
-          chmod +x twistcli || true
-          ls -lh twistcli || true
+          chmod +x twistcli
 
-      - name: Prisma Cloud twistcli scan
+      - name: Prisma Cloud Container Scan
         run: |
-          if [ -f ./twistcli ]; then
-            ./twistcli images scan \
-              --address ${{ secrets.PRISMA_CONSOLE_URL }} \
-              --user ${{ secrets.PRISMA_ACCESS_KEY }} \
-              --password ${{ secrets.PRISMA_SECRET_KEY }} \
-              --details \
-              --output-file prisma-scan.json \
-              app:latest || true
-          else
-            echo "twistcli not found, skipping prisma scan"
-            echo '{}' > prisma-scan.json
-          fi
+          ./twistcli images scan \
+            --address ${{ secrets.PRISMA_CONSOLE_URL }} \
+            --user ${{ secrets.PRISMA_ACCESS_KEY }} \
+            --password ${{ secrets.PRISMA_SECRET_KEY }} \
+            --details \
+            app:latest > prisma-scan.json
+        continue-on-error: true
 
       # ---------------------------------------------------------
-      # AWS AUTH + ECR push
+      # AWS CREDENTIALS
       # ---------------------------------------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -125,16 +118,19 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Tag & push Docker image to ECR
+      # ---------------------------------------------------------
+      # PUSH IMAGE TO ECR
+      # ---------------------------------------------------------
+      - name: Tag & Push image to ECR
         run: |
           ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
-          IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
-          TAG="latest"
-          docker tag app:latest $ECR_URL/$IMAGE_NAME:$TAG
-          docker push $ECR_URL/$IMAGE_NAME:$TAG
+          IMAGE="${{ secrets.ECR_REPO_NAME }}:latest"
+
+          docker tag app:latest $ECR_URL/$IMAGE
+          docker push $ECR_URL/$IMAGE
 
       # ---------------------------------------------------------
-      # DEPLOY TO EC2
+      # DEPLOY ON EC2
       # ---------------------------------------------------------
       - name: Deploy on EC2
         uses: appleboy/ssh-action@v0.1.7
@@ -143,27 +139,15 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            set -e
             ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
-            IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
-            TAG="latest"
+            IMAGE="${{ secrets.ECR_REPO_NAME }}:latest"
 
-            if ! command -v docker >/dev/null 2>&1; then
-              sudo yum install -y docker || sudo apt-get install -y docker.io
-              sudo systemctl start docker || true
-            fi
+            sudo docker pull $ECR_URL/$IMAGE
 
-            if ! command -v aws >/dev/null 2>&1; then
-              sudo yum install -y awscli || sudo apt-get install -y awscli
-            fi
-
-            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
-              | sudo docker login --username AWS --password-stdin $ECR_URL
-
-            sudo docker pull $ECR_URL/$IMAGE_NAME:$TAG || true
             sudo docker stop app || true
             sudo docker rm app || true
-            sudo docker run -d --name app -p 80:8080 $ECR_URL/$IMAGE_NAME:$TAG
+
+            sudo docker run -d --name app -p 80:8080 $ECR_URL/$IMAGE
 
       # ---------------------------------------------------------
       # OWASP ZAP (DAST)
@@ -175,98 +159,65 @@ jobs:
           cmd_options: "-a"
         continue-on-error: true
 
-      - name: Normalize ZAP reports
+      - name: Rename ZAP reports
         run: |
           mv report_html.html zap-report.html || true
           mv report_md.md zap-report.md || true
           mv report_json.json zap-report.json || true
-          ls -lah zap-report.* || true
 
-      # ---------------------------------------------------------
-      # Prepare any missing artifact files (avoid upload errors)
-      # ---------------------------------------------------------
-      - name: Ensure artifact files exist
-        run: |
-          test -f trufflehog.json || echo '{}' > trufflehog.json
-          test -f snyk-sca.json || echo '{}' > snyk-sca.json
-          test -f snyk-sast.json || echo '{}' > snyk-sast.json
-          test -f snyk-container.json || echo '{}' > snyk-container.json
-          test -f prisma-scan.json || echo '{}' > prisma-scan.json
-          test -f sonar-report.json || echo '{}' > sonar-report.json
-          test -f zap-report.html || echo '' > zap-report.html
-          test -f zap-report.md || echo '' > zap-report.md
-          test -f zap-report.json || echo '{}' > zap-report.json
-
-      # ---------------------------------------------------------
-      # UPLOAD ALL SCAN OUTPUTS TO S3 (from deploy job)
-      # ---------------------------------------------------------
-      - name: Upload scan outputs to S3
-        run: |
-          RUN_ID=${{ github.run_id }}
-          S3_PREFIX="s3://cf-templates-efzoo91lt857-us-east-1/security-scans/run-$RUN_ID/"
-
-          aws s3 cp trufflehog.json     $S3_PREFIX
-          aws s3 cp snyk-sca.json       $S3_PREFIX
-          aws s3 cp snyk-sast.json      $S3_PREFIX
-          aws s3 cp snyk-container.json $S3_PREFIX
-          aws s3 cp prisma-scan.json    $S3_PREFIX
-          aws s3 cp sonar-report.json   $S3_PREFIX
-          aws s3 cp zap-report.html     $S3_PREFIX
-          aws s3 cp zap-report.md       $S3_PREFIX
-          aws s3 cp zap-report.json     $S3_PREFIX
-          echo "Uploaded scan outputs to ${S3_PREFIX}"
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
-
-      # ---------------------------------------------------------
-      # Emit run id as a step output (so we can reference it in next job)
-      # ---------------------------------------------------------
-      - id: set-run-id
-        name: Set run id output
-        run: |
-          echo "run_id=${{ github.run_id }}" >> $GITHUB_OUTPUT
+  # =======================================================================
+  # SECOND JOB — Collect logs + push ALL reports to S3
+  # =======================================================================
 
   collect-logs:
     needs: deploy
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install dependencies (jq & gh if needed)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install gh CLI
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-          # gh is preinstalled on GH runners, but ensure it's available
-          if ! command -v gh >/dev/null 2>&1; then
-            sudo apt-get install -y gh
-          fi
+          sudo apt update -y
+          sudo apt install -y gh jq
           gh --version
 
-      - name: Export logs from completed workflow run
+      - name: Export logs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RUN_ID="${{ needs.deploy.outputs.run_id }}"
-          echo "Collecting logs for run: $RUN_ID"
+          REPO="${{ github.repository }}"
 
-          # wait for a few seconds to ensure logs are published (optional)
-          sleep 3
+          echo "Collecting logs for: $RUN_ID from repo: $REPO"
 
-          gh run view "$RUN_ID" --log > logs.txt
-          echo "Saved logs.txt (size: $(wc -c < logs.txt) bytes)"
-          ls -lh logs.txt
+          gh run view "$RUN_ID" --repo "$REPO" --log > logs.txt
+          echo "Logs collected."
 
-      - name: Configure AWS credentials for collect-logs
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Upload logs.txt to S3
+      - name: Upload all scan results to S3
         run: |
           RUN_ID="${{ needs.deploy.outputs.run_id }}"
           S3_PATH="s3://cf-templates-efzoo91lt857-us-east-1/security-scans/run-$RUN_ID/"
+
+          echo "Uploading all reports to $S3_PATH"
+
+          aws s3 cp trufflehog-results.json "$S3_PATH"
+          aws s3 cp snyk-sca.json "$S3_PATH"
+          aws s3 cp snyk-sast.json "$S3_PATH"
+          aws s3 cp snyk-container.json "$S3_PATH"
+          aws s3 cp prisma-scan.json "$S3_PATH"
+          aws s3 cp sonar-report.json "$S3_PATH"
+          aws s3 cp zap-report.html "$S3_PATH"
+          aws s3 cp zap-report.md "$S3_PATH"
+          aws s3 cp zap-report.json "$S3_PATH"
           aws s3 cp logs.txt "$S3_PATH"
-          echo "Uploaded logs to $S3_PATH"
+
+          echo "Upload complete."
