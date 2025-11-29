@@ -7,6 +7,9 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
 
     steps:
 
@@ -121,7 +124,10 @@ jobs:
           IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
           TAG="latest"
 
+          echo "Tagging image..."
           docker tag app:latest $ECR_URL/$IMAGE_NAME:$TAG
+
+          echo "Pushing to ECR..."
           docker push $ECR_URL/$IMAGE_NAME:$TAG
 
       # ---------------------------------------------------------
@@ -174,3 +180,22 @@ jobs:
             report_md.md
             report_json.json
           if-no-files-found: warn
+
+      # ---------------------------------------------------------
+      # EXPORT PIPELINE LOGS AS logs.txt ARTIFACT
+      # ---------------------------------------------------------
+      - name: Export GitHub Actions Logs
+        run: |
+          echo "Downloading workflow logs..."
+          gh run download ${{ github.run_id }} --log -D logs_folder
+
+          find logs_folder -type f -name "*.txt" -exec cat {} + > logs.txt
+          ls -al logs.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload pipeline logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-logs
+          path: logs.txt
