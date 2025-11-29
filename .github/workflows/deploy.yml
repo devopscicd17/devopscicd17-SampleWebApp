@@ -16,7 +16,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # required for TruffleHog
+          fetch-depth: 0
 
       # ---------------------------------------------------------
       # BUILD (Maven)
@@ -68,7 +68,6 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      # Build image for Snyk container scan
       - name: Build Docker Image for Snyk Scan
         run: docker build -t app:latest .
 
@@ -76,6 +75,29 @@ jobs:
         run: snyk container test app:latest --severity-threshold=high
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      # ---------------------------------------------------------
+      # PRISMA CLOUD - Twistcli Container Scan
+      # ---------------------------------------------------------
+      - name: Download twistcli
+        run: |
+          echo "Downloading twistcli from Prisma Cloud..."
+          curl -u "${{ secrets.PRISMA_ACCESS_KEY }}:${{ secrets.PRISMA_SECRET_KEY }}" \
+            --output twistcli \
+            "${{ secrets.PRISMA_CONSOLE_URL }}/api/v1/util/twistcli"
+
+          chmod +x twistcli
+
+      - name: Prisma Cloud Container Scan
+        run: |
+          echo "Running Prisma Cloud twistcli scan..."
+          ./twistcli images scan \
+            --address ${{ secrets.PRISMA_CONSOLE_URL }} \
+            --user ${{ secrets.PRISMA_ACCESS_KEY }} \
+            --password ${{ secrets.PRISMA_SECRET_KEY }} \
+            --details \
+            app:latest
+        continue-on-error: false
 
       # ---------------------------------------------------------
       # AWS CREDENTIALS
@@ -99,13 +121,7 @@ jobs:
           IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
           TAG="latest"
 
-          echo "Building Docker Image..."
-          docker build -t $IMAGE_NAME:$TAG .
-
-          echo "Tagging Image..."
-          docker tag $IMAGE_NAME:$TAG $ECR_URL/$IMAGE_NAME:$TAG
-
-          echo "Pushing Image to ECR..."
+          docker tag app:latest $ECR_URL/$IMAGE_NAME:$TAG
           docker push $ECR_URL/$IMAGE_NAME:$TAG
 
       # ---------------------------------------------------------
@@ -131,21 +147,13 @@ jobs:
               sudo yum install awscli -y || sudo apt install awscli -y
             fi
 
-            echo "Logging into ECR..."
             aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
               | sudo docker login --username AWS --password-stdin $ECR_URL
 
-            echo "Pulling Latest Image..."
             sudo docker pull $ECR_URL/$IMAGE_NAME:$TAG
-
-            echo "Stopping Old Container..."
             sudo docker stop app || true
             sudo docker rm app || true
-
-            echo "Starting New Container..."
             sudo docker run -d --name app -p 80:8080 $ECR_URL/$IMAGE_NAME:$TAG
-
-            echo "Deployment completed successfully!"
 
       # ---------------------------------------------------------
       # OWASP ZAP (DAST)
@@ -157,7 +165,6 @@ jobs:
           cmd_options: "-a"
         continue-on-error: true
 
-      # Upload ZAP artifacts
       - name: Upload ZAP Reports
         uses: actions/upload-artifact@v4
         with:
