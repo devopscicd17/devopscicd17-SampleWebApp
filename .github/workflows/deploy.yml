@@ -9,199 +9,203 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    # ---------------------------------------------------------
-    # CHECKOUT
-    # ---------------------------------------------------------
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
 
-    # ---------------------------------------------------------
-    # JAVA + BUILD
-    # ---------------------------------------------------------
-    - name: Set up Java
-      uses: actions/setup-java@v3
-      with:
-        java-version: "17"
-        distribution: "temurin"
+      # ---------------------------------------------------------
+      # CHECKOUT
+      # ---------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Build WAR using Maven
-      run: mvn -B clean package --file pom.xml
+      # ---------------------------------------------------------
+      # BUILD (Maven)
+      # ---------------------------------------------------------
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: "17"
+          distribution: "temurin"
 
-    # ---------------------------------------------------------
-    # 1️⃣ TRUFFLEHOG SECRET SCAN (JSON OUTPUT FIX ADDED)
-    # ---------------------------------------------------------
-    - name: Install TruffleHog
-      run: pip install trufflehog==3.72.0
+      - name: Build WAR using Maven
+        run: mvn -B clean package --file pom.xml
 
-    - name: Run TruffleHog Secrets Scan
-      run: |
-        trufflehog git . --json --fail > trufflehog.json || true
-        echo "TruffleHog scan completed"
+      # ---------------------------------------------------------
+      # TRUFFLEHOG (Docker-based + JSON Output)
+      # ---------------------------------------------------------
+      - name: Run TruffleHog Secrets Scan
+        run: |
+          echo "Running TruffleHog via Docker..."
+          docker run --rm -v $PWD:/repo trufflesecurity/trufflehog:latest \
+            git /repo --json > trufflehog.json || true
 
-    # ---------------------------------------------------------
-    # 2️⃣ SONARCLOUD (SAST)
-    # ---------------------------------------------------------
-    - name: SonarCloud Scan
-      uses: SonarSource/sonarcloud-github-action@v2
-      env:
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-      with:
-        projectBaseDir: .
+          echo "Generated trufflehog.json:"
+          ls -lh trufflehog.json
 
-    - name: Save Sonar Report
-      run: |
-        echo '{"note":"SonarCloud does not support raw JSON export via API in CI"}' > sonar-report.json
+      # ---------------------------------------------------------
+      # SAST (SonarCloud)
+      # ---------------------------------------------------------
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          projectBaseDir: .
+          args: >
+            -Dsonar.qualitygate.wait=true
+      - name: Save Sonar Report (JSON)
+        run: |
+          echo '{"status": "completed"}' > sonar-report.json
 
-    # ---------------------------------------------------------
-    # 3️⃣ SNYK (SCA + SAST + Container Scan)
-    # ---------------------------------------------------------
-    - name: Install Snyk CLI
-      uses: snyk/actions/setup@v1
-      env:
-        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      # ---------------------------------------------------------
+      # SNYK (SCA + SAST + Container Scan)
+      # ---------------------------------------------------------
+      - name: Install Snyk CLI
+        uses: snyk/actions/setup@v1
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-    - name: Snyk Open Source Scan (SCA)
-      run: snyk test --json > snyk-sca.json || true
-      env:
-        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      - name: Snyk Open Source Scan (SCA)
+        run: snyk test --json-file-output=snyk-sca.json || true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-    - name: Snyk Code Scan (SAST)
-      run: snyk code test --json > snyk-sast.json || true
-      env:
-        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      - name: Snyk Code Scan (SAST)
+        run: snyk code test --json-file-output=snyk-sast.json || true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-    - name: Build Docker Image for Scans
-      run: docker build -t app:latest .
+      - name: Build Docker Image for Snyk Scan
+        run: docker build -t app:latest .
 
-    - name: Snyk Container Scan
-      run: snyk container test app:latest --json > snyk-container.json || true
-      env:
-        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      - name: Snyk Container Scan
+        run: snyk container test app:latest --json-file-output=snyk-container.json || true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-    # ---------------------------------------------------------
-    # 4️⃣ PRISMA CLOUD - twistcli Container Scan
-    # ---------------------------------------------------------
-    - name: Download twistcli
-      run: |
-        echo "Downloading twistcli..."
-        curl -u "${{ secrets.PRISMA_ACCESS_KEY }}:${{ secrets.PRISMA_SECRET_KEY }}" \
-          --output twistcli \
-          "${{ secrets.PRISMA_CONSOLE_URL }}/api/v1/util/twistcli"
-        chmod +x twistcli
+      # ---------------------------------------------------------
+      # PRISMA CLOUD - twistcli Container Scan
+      # ---------------------------------------------------------
+      - name: Download twistcli
+        run: |
+          curl -u "${{ secrets.PRISMA_ACCESS_KEY }}:${{ secrets.PRISMA_SECRET_KEY }}" \
+            --output twistcli \
+            "${{ secrets.PRISMA_CONSOLE_URL }}/api/v1/util/twistcli"
 
-    - name: Prisma Scan
-      run: |
-        ./twistcli images scan \
-          --address ${{ secrets.PRISMA_CONSOLE_URL }} \
-          --user ${{ secrets.PRISMA_ACCESS_KEY }} \
-          --password ${{ secrets.PRISMA_SECRET_KEY }} \
-          --details \
-          --output-file prisma-scan.json \
-          app:latest || true
+          chmod +x twistcli
 
-    # ---------------------------------------------------------
-    # 5️⃣ AWS AUTH + PUSH IMAGE TO ECR
-    # ---------------------------------------------------------
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
+      - name: Prisma Cloud Container Scan
+        run: |
+          ./twistcli images scan \
+            --address ${{ secrets.PRISMA_CONSOLE_URL }} \
+            --user ${{ secrets.PRISMA_ACCESS_KEY }} \
+            --password ${{ secrets.PRISMA_SECRET_KEY }} \
+            --details \
+            app:latest > prisma-scan.json || true
 
-    - name: Login to Amazon ECR
-      uses: aws-actions/amazon-ecr-login@v1
+      # ---------------------------------------------------------
+      # AWS LOGIN
+      # ---------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-    - name: Push Image to ECR
-      run: |
-        ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
-        IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
-        TAG="latest"
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1
 
-        docker tag app:latest $ECR_URL/$IMAGE_NAME:$TAG
-        docker push $ECR_URL/$IMAGE_NAME:$TAG
-
-    # ---------------------------------------------------------
-    # 6️⃣ DEPLOY TO EC2
-    # ---------------------------------------------------------
-    - name: Deploy on EC2
-      uses: appleboy/ssh-action@v0.1.7
-      with:
-        host: ${{ secrets.EC2_HOST }}
-        username: ${{ secrets.EC2_USER }}
-        key: ${{ secrets.EC2_SSH_KEY }}
-        script: |
-          ECR="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
-          IMG="${{ secrets.ECR_REPO_NAME }}"
+      # ---------------------------------------------------------
+      # BUILD + PUSH IMAGE TO ECR
+      # ---------------------------------------------------------
+      - name: Tag & Push Docker Image to ECR
+        run: |
+          ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+          IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
           TAG="latest"
 
-          if ! command -v docker &> /dev/null; then
-            sudo yum install docker -y || sudo apt install docker.io -y
-            sudo systemctl start docker
-          fi
+          docker tag app:latest $ECR_URL/$IMAGE_NAME:$TAG
+          docker push $ECR_URL/$IMAGE_NAME:$TAG
 
-          if ! command -v aws &> /dev/null; then
-            sudo yum install awscli -y || sudo apt install awscli -y
-          fi
+      # ---------------------------------------------------------
+      # DEPLOY ON EC2
+      # ---------------------------------------------------------
+      - name: Deploy on EC2
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+            IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
+            TAG="latest"
 
-          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
-            | sudo docker login --username AWS --password-stdin $ECR
+            # Install Docker if needed
+            if ! command -v docker &> /dev/null; then
+              sudo yum install docker -y || sudo apt install docker.io -y
+              sudo systemctl start docker
+            fi
 
-          sudo docker pull $ECR/$IMG:$TAG
+            # Login + Pull
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+              | sudo docker login --username AWS --password-stdin $ECR_URL
 
-          sudo docker stop app || true
-          sudo docker rm app || true
+            sudo docker pull $ECR_URL/$IMAGE_NAME:$TAG
+            sudo docker stop app || true
+            sudo docker rm app || true
 
-          sudo docker run -d --name app -p 80:8080 $ECR/$IMG:$TAG
+            sudo docker run -d --name app -p 80:8080 $ECR_URL/$IMAGE_NAME:$TAG
 
-    # ---------------------------------------------------------
-    # 7️⃣ OWASP ZAP Baseline Scan
-    # ---------------------------------------------------------
-    - name: Run OWASP ZAP Baseline Scan
-      uses: zaproxy/action-baseline@v0.10.0
-      with:
-        target: "http://${{ secrets.EC2_HOST }}"
-        cmd_options: "-a"
-      continue-on-error: true
+      # ---------------------------------------------------------
+      # OWASP ZAP (DAST)
+      # ---------------------------------------------------------
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: "http://${{ secrets.EC2_HOST }}"
+          cmd_options: "-a"
+        continue-on-error: true
 
-    # Rename ZAP output
-    - name: Rename ZAP files
-      run: |
-        mv report_html.html zap-report.html || true
-        mv report_md.md zap-report.md || true
-        mv report_json.json zap-report.json || true
+      - name: Rename ZAP Reports
+        run: |
+          mv report_html.html zap-report.html || true
+          mv report_md.md zap-report.md || true
+          mv report_json.json zap-report.json || true
 
-    # ---------------------------------------------------------
-    # 8️⃣ EXPORT PIPELINE LOGS
-    # ---------------------------------------------------------
-    - name: Export Pipeline Logs
-      run: |
-        echo "Exporting GitHub workflow logs..."
-        gh run view ${{ github.run_id }} --log > logs.txt || true
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # ---------------------------------------------------------
+      # EXPORT PIPELINE LOGS
+      # ---------------------------------------------------------
+      - name: Export GitHub Actions Logs
+        run: |
+          echo "Exporting logs..."
+          gh run view ${{ github.run_id }} --log > logs.txt
+          ls -lh logs.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    # ---------------------------------------------------------
-    # 9️⃣ UPLOAD ALL REPORTS TO AWS S3
-    # ---------------------------------------------------------
-    - name: Upload All Reports to S3
-      run: |
-        RUN_ID=${{ github.run_id }}
-        S3_PATH="s3://cf-templates-efzoo91lt857-us-east-1/security-scans/run-$RUN_ID/"
-        echo "Uploading to $S3_PATH"
+      # ---------------------------------------------------------
+      # UPLOAD ALL SCAN OUTPUT TO S3
+      # ---------------------------------------------------------
+      - name: Upload all scan reports to S3
+        run: |
+          RUN_ID=${{ github.run_id }}
+          S3_PATH="s3://cf-templates-efzoo91lt857-us-east-1/security-scans/run-$RUN_ID/"
 
-        aws s3 cp trufflehog.json     $S3_PATH || true
-        aws s3 cp snyk-sca.json       $S3_PATH || true
-        aws s3 cp snyk-sast.json      $S3_PATH || true
-        aws s3 cp snyk-container.json $S3_PATH || true
-        aws s3 cp prisma-scan.json    $S3_PATH || true
-        aws s3 cp sonar-report.json   $S3_PATH || true
-        aws s3 cp zap-report.html     $S3_PATH || true
-        aws s3 cp zap-report.md       $S3_PATH || true
-        aws s3 cp zap-report.json     $S3_PATH || true
-        aws s3 cp logs.txt            $S3_PATH || true
+          mkdir -p artifacts
+          cp trufflehog.json artifacts/ || true
+          cp snyk-sca.json artifacts/ || true
+          cp snyk-sast.json artifacts/ || true
+          cp snyk-container.json artifacts/ || true
+          cp prisma-scan.json artifacts/ || true
+          cp sonar-report.json artifacts/ || true
+          cp zap-report.html artifacts/ || true
+          cp zap-report.md artifacts/ || true
+          cp zap-report.json artifacts/ || true
+          cp logs.txt artifacts/ || true
 
-        echo "Uploaded all security reports to: $S3_PATH"
+          aws s3 cp artifacts $S3_PATH --recursive
+
+          echo "Uploaded all scan reports to: $S3_PATH"
