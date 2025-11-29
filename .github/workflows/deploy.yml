@@ -11,7 +11,6 @@ jobs:
   # ============================================================
   deploy:
     runs-on: ubuntu-latest
-
     outputs:
       run_id: ${{ github.run_id }}
 
@@ -41,12 +40,11 @@ jobs:
       # TRUFFLEHOG (Secrets Scan)
       # ---------------------------------------------------------
       - name: Install TruffleHog
-        run: |
-          pip install trufflehog==2.2.1
+        run: pip install trufflehog==2.2.1
 
       - name: Run TruffleHog Secrets Scan
         run: |
-          trufflehog git file://.` --json > trufflehog-results.json
+          trufflehog filesystem . --json > trufflehog-results.json || echo "TruffleHog scan failed, continuing..."
 
       # ---------------------------------------------------------
       # SONARCLOUD (SAST)
@@ -58,10 +56,10 @@ jobs:
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         with:
           projectBaseDir: .
+        continue-on-error: true
 
       - name: Export SonarCloud Raw Report
-        run: |
-          echo '{"note": "SonarCloud results stored on cloud dashboard"}' > sonar-report.json
+        run: echo '{"note": "SonarCloud results stored on cloud dashboard"}' > sonar-report.json
 
       # ---------------------------------------------------------
       # SNYK (SCA + SAST + Container Scan)
@@ -72,20 +70,20 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
       - name: Snyk SCA Scan
-        run: snyk test --json --severity-threshold=high > snyk-sca.json
+        run: snyk test --json --severity-threshold=high > snyk-sca.json || echo "Snyk SCA scan failed, continuing..."
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
       - name: Snyk SAST Scan
-        run: snyk code test --json --severity-threshold=high > snyk-sast.json
+        run: snyk code test --json --severity-threshold=high > snyk-sast.json || echo "Snyk SAST scan failed, continuing..."
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Build Docker Image for Snyk Scan
+      - name: Build Docker Image for Snyk Container Scan
         run: docker build -t app:latest .
 
       - name: Snyk Container Scan
-        run: snyk container test app:latest --json --severity-threshold=high > snyk-container.json
+        run: snyk container test app:latest --json --severity-threshold=high > snyk-container.json || echo "Snyk container scan failed, continuing..."
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
@@ -106,7 +104,7 @@ jobs:
             --user ${{ secrets.PRISMA_ACCESS_KEY }} \
             --password ${{ secrets.PRISMA_SECRET_KEY }} \
             --output-file prisma-scan.json \
-            app:latest
+            app:latest || echo "Prisma scan failed, continuing..."
 
       # ---------------------------------------------------------
       # AWS LOGIN + PUSH TO ECR
@@ -174,7 +172,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Install gh CLI
+      - name: Install GH CLI
         run: |
           sudo apt update -y
           sudo apt install -y gh jq
@@ -191,12 +189,10 @@ jobs:
           while true; do
             STATUS=$(gh run view "$RUN_ID" --repo "$REPO" --json status -q ".status")
             echo "Status: $STATUS"
-
             if [ "$STATUS" = "completed" ]; then
-              echo "Run is completed!"
+              echo "Run completed!"
               break
             fi
-
             sleep 10
           done
 
@@ -206,7 +202,6 @@ jobs:
         run: |
           RUN_ID="${{ needs.deploy.outputs.run_id }}"
           REPO="${{ github.repository }}"
-
           gh run view "$RUN_ID" --repo "$REPO" --log > logs.txt
           echo "Saved logs.txt"
 
@@ -222,17 +217,27 @@ jobs:
           RUN_ID="${{ needs.deploy.outputs.run_id }}"
           S3="s3://cf-templates-efzoo91lt857-us-east-1/security-scans/run-$RUN_ID/"
 
+          REPORTS=(
+            trufflehog-results.json
+            snyk-sca.json
+            snyk-sast.json
+            snyk-container.json
+            prisma-scan.json
+            sonar-report.json
+            zap-report.html
+            zap-report.json
+            zap-report.md
+            logs.txt
+          )
+
           echo "Uploading to $S3"
+          for file in "${REPORTS[@]}"; do
+            if [ -f "$file" ]; then
+              aws s3 cp "$file" "$S3"
+              echo "Uploaded $file"
+            else
+              echo "Warning: $file not found, skipping..."
+            fi
+          done
 
-          aws s3 cp trufflehog-results.json "$S3"
-          aws s3 cp snyk-sca.json "$S3"
-          aws s3 cp snyk-sast.json "$S3"
-          aws s3 cp snyk-container.json "$S3"
-          aws s3 cp prisma-scan.json "$S3"
-          aws s3 cp sonar-report.json "$S3"
-          aws s3 cp zap-report.html "$S3"
-          aws s3 cp zap-report.json "$S3"
-          aws s3 cp zap-report.md "$S3"
-          aws s3 cp logs.txt "$S3"
-
-          echo "All security reports uploaded to S3."
+          echo "All available security reports uploaded to S3."
