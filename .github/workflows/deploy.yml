@@ -186,29 +186,13 @@ jobs:
           sudo apt install -y gh jq
           gh --version
 
-      - name: Wait for workflow run to COMPLETE
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          RUN_ID="${{ needs.deploy.outputs.run_id }}"
-          REPO="${{ github.repository }}"
-          echo "Waiting for workflow run $RUN_ID to complete..."
-          while true; do
-            STATUS=$(gh run view "$RUN_ID" --repo "$REPO" --json status -q ".status")
-            echo "Status: $STATUS"
-            if [ "$STATUS" = "completed" ]; then
-              echo "Run completed!"
-              break
-            fi
-            sleep 10
-          done
-
       - name: Export logs into logs.txt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RUN_ID="${{ needs.deploy.outputs.run_id }}"
           REPO="${{ github.repository }}"
+          echo "Collecting logs for run $RUN_ID..."
           gh run view "$RUN_ID" --repo "$REPO" --log > logs.txt
           echo "Saved logs.txt"
 
