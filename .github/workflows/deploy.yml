@@ -3,10 +3,17 @@ name: Build, Scan & Deploy Docker to EC2 via ECR
 on:
   push:
     branches: ["main"]
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      actions: read
+      issues: read
+      pull-requests: read
 
     steps:
 
@@ -19,14 +26,32 @@ jobs:
           fetch-depth: 0
 
       # ---------------------------------------------------------
-      # BUILD (Maven)
+      # SETUP: Java, Docker, AWS CLI, GH CLI
       # ---------------------------------------------------------
-      - name: Set up Java
+      - name: Set up Java 17
         uses: actions/setup-java@v3
         with:
           java-version: "17"
           distribution: "temurin"
 
+      - name: Set up Docker Buildx (for docker)
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install tools (jq, awscli, gh)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq zip unzip
+          # install awscli v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install || true
+          # install gh
+          sudo apt-get install -y gh || true
+          gh --version || true
+
+      # ---------------------------------------------------------
+      # BUILD (Maven)
+      # ---------------------------------------------------------
       - name: Build WAR using Maven
         run: mvn -B clean package --file pom.xml
 
@@ -55,51 +80,54 @@ jobs:
       # ---------------------------------------------------------
       - name: Install Snyk CLI
         uses: snyk/actions/setup@v1
+        with:
+          version: 'latest'
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Snyk Open Source Scan (SCA)
-        run: snyk test --severity-threshold=high
+      - name: Snyk Open Source Scan (SCA) -> JSON
+        run: snyk test --json > snyk-sca.json
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Snyk Code Scan (SAST)
-        run: snyk code test --severity-threshold=high
+      - name: Snyk Code Scan (SAST) -> JSON
+        run: snyk code test --json > snyk-code.json
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Build Docker Image for Snyk Scan
+      - name: Build Docker Image for Snyk Container Scan
         run: docker build -t app:latest .
 
-      - name: Snyk Container Scan
-        run: snyk container test app:latest --severity-threshold=high
+      - name: Snyk Container Scan -> JSON
+        run: snyk container test app:latest --json > snyk-container.json
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
       # ---------------------------------------------------------
-      # PRISMA CLOUD - Twistcli Container Scan
+      # PRISMA CLOUD - twistcli Container Scan (download + JSON)
       # ---------------------------------------------------------
       - name: Download twistcli
         run: |
           echo "Downloading twistcli from Prisma Cloud..."
-          curl -u "${{ secrets.PRISMA_ACCESS_KEY }}:${{ secrets.PRISMA_SECRET_KEY }}" \
+          curl -s -u "${{ secrets.PRISMA_ACCESS_KEY }}:${{ secrets.PRISMA_SECRET_KEY }}" \
             --output twistcli \
             "${{ secrets.PRISMA_CONSOLE_URL }}/api/v1/util/twistcli"
           chmod +x twistcli
 
-      - name: Prisma Cloud Container Scan
+      - name: Prisma Cloud Container Scan -> JSON
         run: |
-          echo "Running Prisma Cloud twistcli scan..."
           ./twistcli images scan \
-            --address ${{ secrets.PRISMA_CONSOLE_URL }} \
-            --user ${{ secrets.PRISMA_ACCESS_KEY }} \
-            --password ${{ secrets.PRISMA_SECRET_KEY }} \
+            --address "${{ secrets.PRISMA_CONSOLE_URL }}" \
+            --user "${{ secrets.PRISMA_ACCESS_KEY }}" \
+            --password "${{ secrets.PRISMA_SECRET_KEY }}" \
             --details \
+            --output-file prisma-twistcli.json \
+            --format json \
             app:latest
         continue-on-error: false
 
       # ---------------------------------------------------------
-      # AWS CREDENTIALS
+      # Configure AWS (for ECR push & S3 uploads)
       # ---------------------------------------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -115,11 +143,14 @@ jobs:
       # BUILD + PUSH IMAGE TO ECR
       # ---------------------------------------------------------
       - name: Tag & Push Docker Image to ECR
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          ECR_REPO_NAME: ${{ secrets.ECR_REPO_NAME }}
         run: |
-          ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
-          IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
+          ECR_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE_NAME="${ECR_REPO_NAME}"
           TAG="latest"
-
           docker tag app:latest $ECR_URL/$IMAGE_NAME:$TAG
           docker push $ECR_URL/$IMAGE_NAME:$TAG
 
@@ -133,17 +164,18 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
+            set -e
             ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
             IMAGE_NAME="${{ secrets.ECR_REPO_NAME }}"
             TAG="latest"
 
             if ! command -v docker &> /dev/null; then
-              sudo yum install docker -y || sudo apt install docker.io -y
-              sudo systemctl start docker
+              sudo yum install -y docker || sudo apt-get install -y docker.io
+              sudo systemctl start docker || true
             fi
 
             if ! command -v aws &> /dev/null; then
-              sudo yum install awscli -y || sudo apt install awscli -y
+              sudo yum install -y awscli || sudo apt-get install -y awscli
             fi
 
             aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
@@ -164,41 +196,104 @@ jobs:
           cmd_options: "-a"
         continue-on-error: true
 
-      - name: Upload ZAP Reports
+      - name: Collect ZAP reports
+        run: |
+          # action-baseline produces: report_html.html report_md.md report_json.json
+          if [ -f report_json.json ]; then cp report_json.json zap-report.json; fi
+          if [ -f report_html.html ]; then cp report_html.html zap-report.html; fi
+          if [ -f report_md.md ]; then cp report_md.md zap-report.md; fi
+        continue-on-error: true
+
+      # ---------------------------------------------------------
+      # Export SonarCloud Issues (API -> JSON)
+      # ---------------------------------------------------------
+      - name: Export SonarCloud issues -> JSON
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          # Use SONAR_HOST_URL if set, otherwise default to sonarcloud.io
+          HOST="${{ secrets.SONAR_HOST_URL }}"
+          if [ -z "$HOST" ] || [ "$HOST" = "null" ]; then
+            HOST="https://sonarcloud.io"
+          fi
+          # use project key = repository path (adjust if you use different Sonar project key)
+          PROJECT_KEY="${{ github.repository }}"
+          curl -s -u "${SONAR_TOKEN}:" "${HOST}/api/issues/search?projects=${PROJECT_KEY}&ps=500" -o sonar-report.json || true
+
+      # ---------------------------------------------------------
+      # Export previous workflow run logs (optional, requires GH_PAT)
+      # ---------------------------------------------------------
+      - name: Export previous run logs (optional)
+        if: ${{ secrets.GH_PAT != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          echo "${GH_TOKEN}" | gh auth login --with-token
+          PREV_RUN_ID=$(gh run list --limit 2 --json databaseId --jq '.[1].databaseId' || echo "")
+          if [ -n "$PREV_RUN_ID" ]; then
+            gh run view "$PREV_RUN_ID" --log > prev_run_logs.txt || true
+          else
+            echo "No previous run id found" > prev_run_logs.txt
+          fi
+
+      # ---------------------------------------------------------
+      # COLLECT / PACKAGE ALL REPORTS
+      # ---------------------------------------------------------
+      - name: Prepare backup folder
+        run: |
+          mkdir -p backup
+          # move/copy all known output files if they exist
+          [ -f sonar-report.json ] && cp sonar-report.json backup/sonar-report.json || echo "no sonar report"
+          [ -f snyk-sca.json ] && cp snyk-sca.json backup/snyk-sca.json || echo "no snyk-sca"
+          [ -f snyk-code.json ] && cp snyk-code.json backup/snyk-code.json || echo "no snyk-code"
+          [ -f snyk-container.json ] && cp snyk-container.json backup/snyk-container.json || echo "no snyk-container"
+          [ -f prisma-twistcli.json ] && cp prisma-twistcli.json backup/prisma-twistcli.json || echo "no prisma twistcli"
+          [ -f zap-report.json ] && cp zap-report.json backup/zap-report.json || echo "no zap json"
+          [ -f zap-report.html ] && cp zap-report.html backup/zap-report.html || true
+          [ -f zap-report.md ] && cp zap-report.md backup/zap-report.md || true
+          [ -f prev_run_logs.txt ] && cp prev_run_logs.txt backup/prev_run_logs.txt || true
+          # add git mirror for complete repo
+          git clone --mirror https://github.com/${{ github.repository }} backup/repo-mirror.git || true
+          # create a small manifest
+          echo "run_id=${{ github.run_id }}" > backup/manifest.txt
+          echo "repo=${{ github.repository }}" >> backup/manifest.txt
+          echo "run_number=${{ github.run_number }}" >> backup/manifest.txt
+          echo "run_attempt=${{ github.run_attempt }}" >> backup/manifest.txt
+          ls -lah backup > backup/backup-listing.txt
+
+      # ---------------------------------------------------------
+      # ZIP the backup (optional)
+      # ---------------------------------------------------------
+      - name: Zip backup folder
+        run: |
+          zip -r full-backup-${{ github.run_id }}.zip backup || true
+
+      # ---------------------------------------------------------
+      # UPLOAD ALL TO S3 (single folder per run)
+      # ---------------------------------------------------------
+      - name: Upload all scan results & backup to S3
+        env:
+          BUCKET: cf-templates-efzoo91lt857-us-east-1
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          set -e
+          DEST="s3://$BUCKET/pipeline-scans/${{ github.run_id }}/"
+          echo "Uploading backup folder to $DEST"
+          aws s3 cp --recursive backup/ "$DEST"
+          # also upload zip file if created
+          if [ -f full-backup-${{ github.run_id }}.zip ]; then
+            aws s3 cp full-backup-${{ github.run_id }}.zip "$DEST"
+          fi
+          echo "Upload complete"
+
+      # ---------------------------------------------------------
+      # Upload GitHub Action artifact (optional quick access)
+      # ---------------------------------------------------------
+      - name: Upload Backup Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: zap-report
+          name: github-self-backup-${{ github.run_id }}
           path: |
-            report_html.html
-            report_md.md
-            report_json.json
-          if-no-files-found: warn
-
-      # ---------------------------------------------------------
-      # EXPORT PREVIOUS PIPELINE LOGS
-      # ---------------------------------------------------------
-      - name: Export Previous Run Logs
-        run: |
-          echo "Fetching previous workflow run ID..."
-
-          PREV_RUN_ID=$(gh run list --limit 2 --json databaseId | jq -r '.[1].databaseId')
-
-          echo "Previous Run ID: $PREV_RUN_ID"
-
-          gh run view $PREV_RUN_ID --log > logs.txt
-
-          echo "Logs generated:"
-          ls -lh logs.txt
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # ---------------------------------------------------------
-      # UPLOAD pipeline logs to S3 bucket
-      # ---------------------------------------------------------
-      - name: Upload pipeline logs to S3
-        run: |
-          aws s3 cp logs.txt s3://cf-templates-efzoo91lt857-us-east-1/pipeline-logs/logs-${{ github.run_id }}.txt
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+            backup
+            full-backup-${{ github.run_id }}.zip
+          retention-days: 30
