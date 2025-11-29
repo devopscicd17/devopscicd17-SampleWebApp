@@ -61,7 +61,8 @@ jobs:
         continue-on-error: true
 
       - name: Export SonarCloud Raw Report
-        run: echo '{"note": "SonarCloud results stored on cloud dashboard"}' > sonar-report.json
+        run: |
+          echo '{"note": "SonarCloud results stored on cloud dashboard"}' > sonar-report.json
         continue-on-error: true
 
       # SNYK (SCA + SAST + Container Scan)
@@ -72,13 +73,15 @@ jobs:
         continue-on-error: true
 
       - name: Snyk SCA Scan
-        run: snyk test --json --severity-threshold=high > snyk-sca.json || echo "Snyk SCA scan failed, continuing..."
+        run: |
+          snyk test --json --severity-threshold=high > snyk-sca.json || echo "Snyk SCA scan failed, continuing..."
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         continue-on-error: true
 
       - name: Snyk SAST Scan
-        run: snyk code test --json --severity-threshold=high > snyk-sast.json || echo "Snyk SAST scan failed, continuing..."
+        run: |
+          snyk code test --json --severity-threshold=high > snyk-sast.json || echo "Snyk SAST scan failed, continuing..."
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         continue-on-error: true
@@ -88,7 +91,8 @@ jobs:
         continue-on-error: true
 
       - name: Snyk Container Scan
-        run: snyk container test app:latest --json --severity-threshold=high > snyk-container.json || echo "Snyk container scan failed, continuing..."
+        run: |
+          snyk container test app:latest --json --severity-threshold=high > snyk-container.json || echo "Snyk container scan failed, continuing..."
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         continue-on-error: true
