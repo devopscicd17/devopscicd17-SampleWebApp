@@ -20,6 +20,25 @@ jobs:
           fetch-depth: 0
 
       # ---------------------------------------------------------
+      # PRISMA CODE REPO SCAN (Checkov - SAST + IaC)
+      # ---------------------------------------------------------
+      - name: Run Prisma Code Repo Scan (Checkov)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          api-key: ${{ secrets.PRISMA_API_KEY }}
+          directory: .
+          output_format: json
+          output_file_path: .
+        continue-on-error: true
+
+      - name: Rename Prisma Code Scan Report
+        run: |
+          if [ -f results.json ]; then
+            mv results.json prisma-code-scan.json
+          fi
+        continue-on-error: true
+
+      # ---------------------------------------------------------
       # BUILD (Maven)
       # ---------------------------------------------------------
       - name: Set up Java
@@ -175,13 +194,13 @@ jobs:
           echo "Run ID: $GITHUB_RUN_ID" > logs.txt
           echo "Repository: $GITHUB_REPOSITORY" >> logs.txt
           ls -lah >> logs.txt
-          # Optionally append summary of scan reports here
 
       - name: Upload all scan reports and logs to S3
         run: |
           S3="s3://cf-templates-efzoo91lt857-us-east-1/security-scans/run-$GITHUB_RUN_ID/"
 
           REPORTS=(
+            prisma-code-scan.json
             trufflehog-results.json
             snyk-sca.json
             snyk-sast.json
